@@ -1,0 +1,1409 @@
+```{r setup, warning=FALSE, message=FALSE, include=FALSE}
+library(lubridate)
+library(tidyverse)
+library(scales)
+library(ggrepel)
+library(gganimate)
+library(tidycensus)
+library(sf)
+library(tigris)
+library(reldist)
+library(rmapshaper)
+library(haven)
+library(grid)
+library(gridExtra)
+library(extrafont)
+loadfonts()
+knitr::opts_chunk$set(echo=FALSE)
+```
+
+```{r data_load, message=FALSE, warning=FALSE, echo=FALSE}
+# Load and clean all data
+source("access_merge.R")
+source("ama_filter.R")
+```
+
+```{r theme, fig.align='center', fig.height=0.4, fig.width=9, echo=FALSE}
+# Defining a custom AMA theme
+theme_ama <- function(
+  base_size = 12,
+  base_family = "Helvetica",
+  base_line_size = base_size / 170,
+  base_rect_size = base_size / 170) {
+  theme_bw(
+    base_size = base_size, 
+    base_family = base_family,
+    base_line_size = base_line_size,
+    base_rect_size = base_rect_size) %+replace%
+  theme(
+    panel.background = element_rect(fill = "white", color = NA),
+    panel.border = element_rect(fill = NA, color = "grey20"),
+    panel.grid = element_line(color = "grey85"),
+    panel.grid.minor = element_line(size = rel(0.5)), 
+    plot.title = element_text(
+      size = 18,
+      face = "bold",
+      color = "grey25",
+      hjust = 0,
+      margin = margin(b = 6)),
+    plot.subtitle = element_text(
+      size = 12,
+      color = "grey35",
+      margin = margin(b = 9),
+      hjust = 0),
+    plot.caption = element_text(
+      size = 12,
+      color = "grey35",
+      face = "italic",
+      margin = margin(t = 12),
+      hjust = 1),
+    axis.title = element_text(size = 14, face = "bold", color = "grey25"),
+    axis.title.x = element_text(margin = margin(t = 7)),
+    axis.title.y = element_text(margin = margin(r = 7), angle = 90),
+    axis.text = element_text(size = 12, color = "grey35"),
+    axis.text.y = element_text(margin = margin(r = 5)),
+    axis.text.x = element_text(margin = margin(t = 5)),
+    legend.key = element_rect(fill = "white", color = NA),
+    legend.title = element_text(color = "grey25", size = 14),
+    legend.text = element_text(
+      color = "grey35",
+      size = 13,
+      margin = margin(l = 3, r = 14)),
+    legend.background = element_blank(),
+    complete = TRUE
+  ) 
+}
+# AMA color palette
+ama_colors <- c('#2a044a', '#3f4d6b', '#6a8d8b',
+                '#ecc9b6', '#fa8e8c', '#fe4365')
+ama_colors_10 <- c('#2a044a','#31325d','#44546f','#5b7781','#759c92',
+                   '#e7d5c0','#f2b6a8','#f99591','#fd717a','#fe4365')
+# Color palette plot
+ggplot() +
+  geom_tile(aes(x = 1:6, y = 1), fill = ama_colors) +
+  scale_x_discrete(expand = c(0, 0)) + 
+  scale_y_discrete(expand= c(0, 0)) + 
+  theme_ama() +
+  theme(
+    axis.title = element_blank(),
+    axis.text = element_blank()
+  )
+```
+
+Rural America is facing a massive and growing shortage of physicians. For the past few decades, doctors have flocked to cities seeking better career opportunities, higher pay, and urban amenities. As a result, only 10% of physicians now live in rural areas, compared to 20% of the overall U.S. population. This maldistribution has potentially disastrous consequences. Studies have shown that having physical access to a doctor is an important determinant of health. For many rural Americans, getting this access requires a long drive and a potentially longer wait, resulting in health consequences. This problem is likely to get worse in the coming decades, as an increasing percentage of physicians choose to practice in urban areas.
+
+# Mapping the Rural Doctor Shortage {#part1}
+
+To better understand the causes and consequences of this shortage, let's start by examining the overall distribution of doctors in the U.S. The map below shows the location of every practicing U.S. MD (Doctor of Medicine) and around 40% of DOs (Doctors of Osteopathic Medicine). An initial look at this map reveals that doctors are clustered around major towns and cities. By itself this isn't problematic; doctors live where there is high demand for their services. But importantly, this map also reveals where doctors do *not* live. Large parts of Texas, Nevada, and the mountain states have a very sparse distribution of doctors, even relative to their sparse populations. For people in those rural areas, this means driving hours to see a doctor that may be busier (has more patients) than an urban doctor. 
+
+</div>
+
+<br>
+
+```{r pop_map_prep, message=FALSE, eval=FALSE}
+# This chunk does the following:
+# 1. Downloads block group geometry files using tigris
+# 2. Simplifies the geometry using mapshaper for quicker intersection
+# 2. Downloads block group populations
+# 4. Merges the population data onto the geometry and saves to RDS
+# Load state and county fips codes
+states <- unique(fips_codes$state_code)[1:51]
+counties <- counties(
+  state = states,
+  cb = TRUE,
+  resolution = "20m",
+  year = "2017",
+  class = "sf"
+)
+# Download all block group geometries using tigris
+bg_geo <- reduce(
+  map(states, function(x) block_groups(x, cb = TRUE, year = 2017)), 
+  rbind
+)
+# Simplify the geometry for faster plotting and intersection
+bg_geo_simplified <- rmapshaper::ms_simplify(input = bg_geo, keep = 0.01) 
+# Convert to sf and transform to CRS 4326, keep only GEOID and geometry
+bg_geo_simplified <- bg_geo_simplified %>%
+  st_as_sf() %>%
+  st_transform(4326) %>%
+  select(GEOID, ALAND)
+# Downlaod the population data for all block groups
+bg_pop <- map2_dfr(
+  .x = counties$STATEFP,
+  .y = counties$COUNTYFP,
+  ~ get_acs(
+    geography = "block group",
+    variables = "B01001_001",
+    state = .x,
+    county = .y
+  )
+)
+# Join geometry and pop data then save to RDS so we don't have to do this again
+bg_geo_simplified %>%
+  left_join(bg_pop, by = "GEOID") %>%
+  rename(geoid = GEOID, name = NAME, land_area = ALAND) %>%
+  write_rds("data/bg_boundaries_pop.rds")
+```
+
+```{r pop_map, message=FALSE, fig.width=9, fig.height=5, fig.align='center'}
+# This chunk does the following:
+# 1. Load the previously created block group data
+# 2. Grabs state geometries from the census, converts to 2163 (Albers)
+# 3. Joins block group data to the AMA file (Albers)
+# 4. Calculates the log doctor density per block group and converts to 2163
+# 5. Defines a bounding box around the NY area to use as a clipping mask
+# 6. Clips all the points from inside that bounding box into their own dataframe
+# 7. Defines a relief subplot of the NY area
+# 8. Creates a whole US main population plot using the location of all doctors
+# 9. Saves the plot
+# Load the previously created block group data
+pop_map_bg_geo <- read_rds("data/bg_boundaries_pop.rds") %>%
+  select(geoid, estimate, land_area) %>%
+  rename(bg_geoid = geoid, bg_population = estimate) %>%
+  mutate(bg_land_area = udunits2::ud.convert(land_area, "m2", "km2")) %>%
+  select(-land_area) 
+# Grabbing the state boundaries from the census
+pop_map_states <- get_acs(
+  geography = "state",
+  variables = c(pop = "B01001_001"),
+  geometry = TRUE,
+  shift_geo = TRUE) %>%
+  st_transform(2163)
+# Joins block group level data to the AMA data
+pop_map_ama_temp <- ama_filtered %>%
+  filter(!is.na(lon) & !is.na(lat) & lon >= -140 & lat >= 20) %>%
+  filter(!(fips_state %in% c("02", "15", "72"))) %>%
+  st_as_sf(coords = c("lon", "lat"), crs = 4326) %>%
+  st_join(pop_map_bg_geo, join = st_within)
+# Get the doctor count per block group, then merge this data back to the AMA
+# file and convert the AMA points to 2163 Albers
+pop_map_ama_locs <- pop_map_ama_temp %>%
+  left_join(
+    pop_map_ama_temp %>%
+      st_set_geometry(NULL) %>%
+      group_by(bg_geoid) %>%
+      summarize(bg_doc_pop = n()),
+    by = "bg_geoid") %>%
+  st_as_sf(coords = c("lon", "lat"), crs = 4326) %>%
+  st_transform(2163) %>%
+  mutate(
+    lon = st_coordinates(geometry)[,1],
+    lat = st_coordinates(geometry)[,2]
+    ) %>%
+  mutate(
+    bg_log_doc = log(bg_doc_pop / bg_land_area),
+    bg_log_pop = log(bg_population / bg_land_area)
+    ) %>%
+  filter(
+    !is.na(bg_log_doc) & !is.infinite(bg_log_doc), 
+    !is.na(bg_log_pop) & !is.infinite(bg_log_pop)
+    ) %>%
+  mutate(
+    bg_log_doc = bg_log_doc - mean(bg_log_doc),
+    bg_log_pop = bg_log_pop - mean(bg_log_pop)
+    )
+# Defining a lat/lon bounding box around the NY region
+pop_map_ny_bb <- tibble(
+    lon = c(-76.2956648209, -68.0484737666),
+    lat = c(39.5472027555, 43.0655158964)
+    ) %>%
+  st_as_sf(coords = c("lon", "lat"), crs = 4326) %>%
+  st_transform(2163) %>%
+  mutate(
+    lon = st_coordinates(geometry)[,1],
+    lat = st_coordinates(geometry)[,2]
+  ) 
+# Clipping the points from the NY region to place them in a relief
+pop_map_ny_bb_points <- pop_map_ama_locs %>%
+  filter(
+    lon >= pop_map_ny_bb$lon[1] & lon <= pop_map_ny_bb$lon[2],
+    lat >= pop_map_ny_bb$lat[1] & lat <= pop_map_ny_bb$lat[2]
+  ) 
+# Define another bounding box to contain the relief map
+pop_map_ny_relief_bb <- tibble(
+    lon = c(-75.0158710035, -51.0086998844),
+    lat = c(17.0223213429, 37.0647098435)
+    ) %>%
+  st_as_sf(coords = c("lon", "lat"), crs = 4326) %>%
+  st_transform(2163) %>%
+  mutate(
+    lon = st_coordinates(geometry)[,1],
+    lat = st_coordinates(geometry)[,2]
+  ) 
+# Define breaks for use in all plots
+pop_map_breaks <- pop_map_ama_locs %>%
+  pull(bg_log_doc) %>%
+  BAMMtools::getJenksBreaks(., 6, 10000)
+# Defines the relief plot to be placed on the main plot
+pop_map_ny_relief_plot <- pop_map_ny_bb_points %>%
+ggplot() +
+  geom_sf(
+    data = pop_map_states %>%
+    filter(!(GEOID %in% c("02", "15"))),
+      fill = "grey85",
+      color = "grey60"
+    ) +
+  geom_point(aes(
+    x = lon,
+    y = lat,
+    color = bg_log_doc),
+    alpha = 0.5,
+    size = 0.1
+    ) +
+  scale_x_continuous(
+    limits = c(pop_map_ny_bb$lon[1], pop_map_ny_bb$lon[2]),
+    expand = c(0,0)
+    ) +
+  scale_y_continuous(
+    limits = c(pop_map_ny_bb$lat[1], pop_map_ny_bb$lat[2]),
+    expand = c(0,0)
+    ) +
+  scale_color_gradientn(
+    colors = rev(ama_colors_10[1:6]),
+    breaks = pop_map_breaks
+    ) +
+  theme_ama() +
+  theme_void() +
+  theme(
+    panel.border = element_rect(color = "grey20", fill = "transparent", size = 2),
+    panel.grid.major = element_line(color = "transparent"),
+    legend.position = "none"
+  )
+# Defining the whole country plot with relief map
+pop_map_ama_locs %>%
+ggplot() +
+  geom_sf(
+    data = pop_map_states %>%
+    filter(!(GEOID %in% c("02", "15"))),
+      fill = "grey85",
+      color = "grey60"
+    ) +
+  geom_point(aes(
+    x = lon,
+    y = lat,
+    color = bg_log_doc),
+    alpha = 0.5,
+    size = 0.1
+    ) +
+  geom_rect(
+    xmin = pop_map_ny_bb$lon[1],
+    xmax = pop_map_ny_bb$lon[2],
+    ymin = pop_map_ny_bb$lat[1],
+    ymax = pop_map_ny_bb$lat[2],
+    fill = NA,
+    color = "grey20"
+    ) +
+  annotate(
+    "segment",
+    x = pop_map_ny_bb$lon[1],
+    xend = pop_map_ny_relief_bb$lon[1],
+    y = pop_map_ny_bb$lat[1],
+    yend = mean(c(
+      pop_map_ny_relief_bb$lat[1],
+      mean(c(pop_map_ny_relief_bb$lat[1], pop_map_ny_relief_bb$lat[2])))),
+    linetype = "dashed",
+    color = "grey35"
+    ) +
+  annotate(
+    "segment",
+    x = pop_map_ny_bb$lon[2],
+    xend = pop_map_ny_relief_bb$lon[2],
+    y = pop_map_ny_bb$lat[2],
+    yend = mean(c(
+      pop_map_ny_relief_bb$lat[2],
+      mean(c(pop_map_ny_relief_bb$lat[2], pop_map_ny_relief_bb$lat[1])))),
+    linetype = "dashed",
+    color = "grey35"
+    ) +
+  annotation_custom(
+    ggplotGrob(pop_map_ny_relief_plot),
+    xmin = pop_map_ny_relief_bb$lon[1],
+    xmax = pop_map_ny_relief_bb$lon[2],
+    ymin = pop_map_ny_relief_bb$lat[1],
+    ymax = pop_map_ny_relief_bb$lat[2]
+    ) +
+  scale_color_gradientn(
+    colors = rev(ama_colors_10[1:6]),
+    breaks = pop_map_breaks
+    ) +
+  labs(
+    title = "Doctors Live Where People Live, Densely Packed Into Cities",
+    subtitle = paste(
+      "Each dot represents one physician, colored by log population density.\n",
+      "           Darker areas have more physicians per square kilometer."),
+    caption = "Source: American Medical Association Master File"
+    ) +
+  theme_void() +
+  theme_ama() +
+  theme(
+    panel.grid.major = element_line(color = "transparent"),
+    panel.border = element_blank(),
+    plot.margin = margin(-20, -20, -20, -20),
+    plot.title = element_text(hjust = .18),
+    plot.subtitle = element_text(
+      hjust = .28,
+      margin = margin(t = 2, b = -20),
+      lineheight = 1.2),
+    plot.caption = element_text(
+      hjust = 0.93,
+      margin = margin(t = -10)),
+    axis.title = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "none"
+  ) +
+  ggsave("plots/p1_pop_map.png", width = 9, height = 5)
+```
+
+<br>
+
+<div class = "text-center">
+
+The trends in doctor density become more obvious after aggregating to the state level. The map below shows the physician-to-population ratio (physicians per 100K people) of each state. This ratio is grouped into quantiles for easier viewing. Southern states (Mississippi and Arkansas), plain states (Iowa, Nebraska), and mountain states (Wyoming, Idaho) have a low number of doctors relative to their population, while the coasts (New Jersey, California) and Midwest (Illinois, Minnesota) have a relative surplus. The Northeast (New York, Massachusetts) also has an enormous surplus of doctors compared to the rest of the country. The causes of this maldistribution are explored in [Part 2](#part2). 
+
+</div>
+
+<br>
+
+```{r state_map, out.width = "1000px", message=FALSE, fig.width=9, fig.height=7, fig.align='center'}
+# This chunk does the following:
+# 1. Grab state geographies from the ACS, then simplify them
+# 2. Get the number of doctors in each state from the AMA
+# 3. Transform this measure into sextiles and then plot a map
+# Get state geography and population data from the ACS
+state_map <- get_acs(
+  geography = "state",
+  variables = c(pop = "B01001_001"),
+  geometry = TRUE,
+  shift_geo = TRUE) 
+# Simplify the state data by piping to rmapshaper
+state_map <- ms_simplify(input = as_Spatial(state_map, TRUE)) %>%
+  st_as_sf()
+# Get the doctor count for each state
+state_data <- ama_filtered %>% 
+  filter(!is.na(geoid)) %>%
+  mutate(state = str_sub(geoid, 1, 2)) %>%
+  group_by(state) %>%
+  summarize(doc_count = n())
+# Plot doctors per 100k on a state-level map
+state_map %>%
+  st_transform(2163) %>%
+  left_join(state_data, by = c("GEOID" = "state")) %>%
+  mutate(
+    docs_per_100k = (doc_count / estimate) * 1e5,
+    docs_ntile = ntile(docs_per_100k, 6)
+    ) %>%
+ggplot() +
+  geom_sf(aes(fill = factor(docs_ntile)), color = "white", size = 0.6) +
+  scale_fill_manual(
+    name = "Sextiles of Docs\nPer 100K Pop.",
+    values = rev(ama_colors),
+    labels = c("Relative\nShortage", rep("", 4), "Relative\nSurplus")
+    ) +
+  labs(
+    title = "Rural States Have a Shortage of Doctors Relative to Their Population",
+    subtitle = paste0(
+      "Measuring physician density per 100k people, the South, Southwest\n",
+      "and Great Plains all face a shortage of both specialists and GPs"),
+    caption = "Source: American Medical Association Master File"
+  ) +
+  theme_void() +
+  theme_ama() +
+  theme(
+    panel.border = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    plot.title = element_text(margin = margin(t = 10), hjust = .7),
+    plot.subtitle = element_text(
+      hjust = .7,
+      margin = margin(t = 7, b = -35),
+      lineheight = 1.2),
+    plot.caption = element_text(
+      hjust = 0.1,
+      margin = margin(t = -20)),
+    panel.grid.major = element_line(color = "transparent"),
+    panel.grid.minor = element_blank(),
+    legend.title = element_text(
+      hjust = 1,
+      margin = margin(l = -20, r = 8)),
+    legend.text = element_text(margin = margin(r = -3)),
+    legend.position = c(1.015, .22),
+    legend.justification = "right"
+  ) +
+  guides(fill = guide_legend(label.position = "left", title.hjust = 1)) + 
+  ggsave("plots/p2_state_map.pdf", width = 9, height = 7)
+```
+
+<br>
+
+<div class = "text-center">
+
+While the state-level trends are informative, the most important and least obvious trends appear at the county level. The map below shows the relative level of primary care accessibility for every county in the United States. The accessibility measurement is based on a forthcoming paper by Saxon and Snow. It uses an optimization-based framework to minimize the driving time and cost of congestion for each patient in a network. In other words, the algorithm chooses the nearest and least-crowded doctor for all patients, *accounting for the doctor choice of all other patients*. 
+
+Since the algorithm runs over the entire U.S., it yields a nationally relative index number that can be used to compare regional or county-level variation in accessibility. In highly accessible (purple) areas, patients drive only a short distance to their doctor and the doctor's office is unlikely to be crowded when they arrive. In inaccessible (pink) areas, patients may drive for hours to their doctor, only to find themselves competing for attention with the many other patients that doctor serves. 
+
+This new method for measuring accessibility reveals an interesting trend: it is not rurality *per se* that influences where doctors live, but rather educational attainment level. In other words, doctors like to live in places where there are many other highly educated people. On the map, this can be seen most clearly in the New England region. Maine, Vermont, and New Hampshire have excellent primary care accessibility despite being relatively rural states. Similarly, Minnesota, Wisconsin, and Iowa are highly accessible despite being mostly rural. Both of these regions contain a large number of highly educated people relative to their population. 
+
+Conversely, Texas and much of the South have poor accessibility despite being relatively more urban. These areas have lower average educational attainment than the rest of the U.S. Previous research (Lombardo, Saxon, Snow and Black) has shown that educational attainment explains over 40% of the variation in physician supply, while population density (rurality) explains less than 10%. However, in most of the U.S., rurality and educational attainment are closely linked. The most severe shortage areas, such as those in southwest Texas, are both extremely rural and extremely under-educated. As such, it is still important to consider the urban/rural context of the shortage. 
+
+</div>
+
+<br>
+
+```{r access_prep, message=FALSE, eval=FALSE}
+# Plot of access scores for all counties, this code is to attempt to speed up
+# mapping using geom_sf, which is horribly slow
+states <- unique(fips_codes$state)[1:51]
+access_temp <- counties(states, cb = TRUE, year = 2017)
+access_temp_simplified <- rmapshaper::ms_simplify(input = access_temp, keep = 0.01) 
+access_temp_elided <- albersusa::points_elided(access_temp_simplified)
+# Code for eliding taken from the albersusa package
+access_ak_bb <- readRDS(system.file("extdata/alaska_bb.rda", package="albersusa"))
+access_ak_poly <- as(raster::extent(as.vector(t(access_ak_bb))), "SpatialPolygons") 
+sp::proj4string(access_ak_poly) <- "+proj=laea +lat_0=45 +lon_0=-100 +x_0=0 +y_0=0 +a=6370997 +b=6370997 +units=m +no_defs"
+access_ak_poly <- access_ak_poly %>% st_as_sf()
+access_hi_bb <- readRDS(system.file("extdata/hawaii_bb.rda", package="albersusa"))
+access_hi_poly <- as(raster::extent(as.vector(t(access_hi_bb))), "SpatialPolygons")
+sp::proj4string(access_hi_poly) <- "+proj=laea +lat_0=45 +lon_0=-100 +x_0=0 +y_0=0 +a=6370997 +b=6370997 +units=m +no_defs"
+access_hi_poly <- access_hi_poly %>% st_as_sf()
+# Transform and remove Alaska + Hawaii, then save
+access_temp_elided %>%
+  st_as_sf() %>%
+  st_transform(2163) %>%
+  mutate(
+    ak_int = lengths(st_intersects(., access_ak_poly)) > 0,
+    hi_int = lengths(st_intersects(., access_hi_poly)) > 0
+    ) %>% 
+  filter(!ak_int & !hi_int) %>%
+  write_rds("data/county_boundaries_simplified.rds")
+```
+
+```{r access_map, message=FALSE, warning=FALSE, fig.width=9, fig.height=7, fig.align='center'}
+# This chunk does the following:
+# 1. Loads the county data created in the previous chunk
+# 2. Aggregates time costs to the county level
+# 3. Bin these aggregated county level values into a histogram, then cut
+#    the histogram into five bins and apply color to each bin
+# 4. Define a bounding box for a histogram inset
+# 5. Plot both county map and a histogram
+# Loading counties and access scores, aggregate to county
+access_counties_gdf <- read_rds("data/county_boundaries_simplified.rds") %>%
+  mutate(GEOID = paste0(STATEFP, COUNTYFP))
+access_scores <- read_csv("data/access_tract_costs_2010_20180815.csv") %>%
+  mutate(
+    geoid = str_pad(geoid, 11, "left", pad = "0"),
+    county = str_sub(geoid, 1, 5)
+    ) %>%
+  group_by(county) %>%
+  summarize(agg_cost = weighted.mean(agg_cost, pop)) %>%
+  mutate(
+    agg_cost = case_when(
+      agg_cost > 3.5 ~ 3.5,
+      agg_cost < 1 ~ 1,
+      TRUE ~ agg_cost),
+    agg_bin = as.numeric(cut(agg_cost, 30, include.lowest = F, right = F)),
+    score_color = cut(agg_bin, 6, include.lowest = F, right = F)
+    )
+# Create a vector of bin labels for histogram
+access_bin_labels <- c(
+  rep("", 3), "Very Low",
+  rep("", 4), "Low",
+  rep("", 4), "Fair",
+  rep("", 7), "Normal",
+  rep("", 5), "High",
+  rep("", 3))
+# Create a histogram plot to inset into the map plot
+access_hist <- access_scores %>%
+  group_by(agg_bin) %>%
+  summarise(
+    agg_bin_n = n(),
+    score_color = first(score_color)
+    ) %>%
+ggplot() +
+  geom_col(aes(
+    x = rev(factor(agg_bin)),
+    y = agg_bin_n,
+    fill = score_color),
+    width = 1
+    ) +
+  scale_x_discrete(
+    name = "Level of Primary Care Access",
+    labels = access_bin_labels,
+    na.translate = FALSE
+    ) +
+  scale_y_continuous(name = "# of Counties", expand = c(0, 0)) +
+  scale_fill_manual(values = ama_colors) +
+  theme_ama() +
+  theme(
+    plot.background = element_rect(fill = "transparent"),
+    panel.border = element_blank(),
+    panel.background = element_rect(fill = "transparent"),
+    panel.grid.major.y = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.title.y = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank(),
+    axis.title.x = element_text(margin = margin(t = 10)),
+    legend.position = "none"
+  )
+# Define a bounding box for the histogram and then convert to sf
+access_hist_bb <- as.matrix(rbind(
+  x = c(-100.9859113661,-78.664835992),
+  y = c(20.1992555939,27.7593372776)))
+colnames(access_hist_bb) <- c("min", "max")
+access_hist_bb <- as(raster::extent(
+  as.vector(t(access_hist_bb))), "SpatialPolygons")
+access_hist_bb <- access_hist_bb %>%
+  st_as_sf() %>%
+  st_set_crs(4326) %>%
+  st_transform(2163) %>%
+  st_coordinates()
+  
+# Creating a map of all counties with histogram
+access_counties_gdf %>%
+  left_join(access_scores, by = c("GEOID" = "county")) %>%
+ggplot() +
+  geom_sf(aes(fill = score_color, color = score_color), size = 0.02) +
+  labs(
+    title = "Rural Counties Have Poor Access to Primary Care",
+    subtitle = paste0(
+      "Patients in rural counties drive farther and wait longer ",
+      "to see a primary care physician than their urban counterparts"),
+    caption = "Source: American Medical Association Master File"
+  ) +
+  scale_fill_manual(
+    values = ama_colors,
+    na.value = "grey90"
+  ) +
+  theme_void() +
+  theme_ama() +
+  theme(
+    panel.border = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    plot.subtitle = element_text(margin = margin(b = -8)),
+    plot.caption = element_text(
+      hjust = 0.0,
+      margin = margin(t = -10)),
+    panel.grid.major = element_line(color = "transparent"),
+    panel.grid.minor = element_blank(),
+    legend.position = "none"
+  ) +
+  annotation_custom(
+    ggplotGrob(access_hist),
+    xmin = access_hist_bb[1,1],
+    xmax = access_hist_bb[3,1],
+    ymin = access_hist_bb[1,2],
+    ymax = mean(c(access_hist_bb[2,2], access_hist_bb[3,2]))
+    ) +
+  guides(fill = guide_legend(label.position = "left", title.hjust = 1)) +
+  ggsave("plots/p3_access_map.png", width = 9, height = 7)
+```
+
+<br>
+
+<div class = "text-center">
+
+Age is also an important part of the urban vs rural doctor story. In the past three decades, more and more young doctors have settled in cities, while very few have moved to rural areas. Furthermore, these young urban doctors tend to stay put, they don't move to rural areas as they get older. As a result, rural doctors tend to be an average of 18 years older than their urban peers. In the plot below, the bulk of the distribution of rural doctors is around 60 years old. Many of these doctors will retire in the next few decades and will not be replaced, severely exacerbating the existing crisis.
+
+</div>
+
+<br>
+
+```{r pop_pyramid, message=FALSE, fig.width=9, fig.height=7, fig.align='center'}
+# This chunk does the following:
+# 1. Loads population data for each CBSA
+# 2. Bin doctors into age and rurality group, then get count per capita (100k)
+# 3. Convert this measure into a population pyramid
+# Load the population for each Core Based Statistical Area
+cbsa_pop <- read_csv("data/tract_qcbsa_2015.csv") %>%
+  group_by(qcbsa) %>%
+  summarize(pop = sum(unique(cbsa_pop), na.rm = T)) %>%
+  mutate(rural = between(`qcbsa`, 0, 2)) %>%
+  group_by(rural) %>%
+  summarize(pop = sum(pop))
+# Perform wrangling and create population pyramid plot
+ama_filtered %>%
+  mutate(
+    age = cut(
+      year(now()) - yob, 
+      breaks = c(seq(0, 100, by = 5), Inf), 
+      labels = c(paste(
+        seq(0, 95, by = 5),
+        seq(0 + 5 - 1, 100 - 1, by = 5),
+        sep = "-"),
+        paste(100, "+", sep = "")),
+      right = FALSE),
+    rural = between(`geoid_qcbsa`, 0, 2)
+    ) %>%
+  mutate(
+    age = replace(
+      age, age %in% c("100+", "95-99", "90-94", "85-89", "80-84"), "75-79")
+    ) %>%
+  group_by(age, rural) %>%
+  summarize(doc_count = n()) %>%
+  filter(!is.na(rural)) %>%
+  left_join(cbsa_pop, by = "rural") %>%
+  ungroup() %>%
+  mutate(
+    docs_per_100k = (doc_count / pop) * 1e5,
+    docs_per_100k = ifelse(rural == "TRUE", docs_per_100k, -docs_per_100k),
+    rural = ifelse(rural == "TRUE", "Rural", "Urban"),
+    age = gsub("75-79", "75+", age)
+    ) %>%
+  filter(!(age %in% c("20-24"))) %>%
+ggplot() +
+  geom_bar(aes(x = age, y = docs_per_100k, fill = rural), stat = "identity") +
+  scale_y_continuous(
+    labels = abs,
+    limits = c(-45, 45),
+    breaks = seq(-40, 40, 10)
+    ) +
+  scale_fill_manual(
+    name = "Type",
+    values = c("Urban" = ama_colors[2], "Rural" = ama_colors[length(ama_colors)]),
+    breaks = c("Urban", "Rural")
+    ) +
+  coord_flip(clip = "off") +
+  labs(
+    title = "Rural Doctors Are Scarcer and Older",
+    subtitle = paste("Young doctors avoid moving to rural areas,",
+                     "leaving a shrinking group of older doctors",
+                     "to pick up the slack"),
+    caption = "Source: American Medical Association Master File",
+    y = "Doctors Per 100K People",
+    x = "Doctor Age"
+  ) + 
+  theme_ama() +
+  theme(legend.position = "none") +
+  annotate("text", label = "Urban", x = 11, y = -20,
+           size = 6, color = ama_colors[2], fontface = "bold") +
+  annotate("text", label = "Rural", x = 11, y = 13,
+           size = 6, color = ama_colors[length(ama_colors)],
+           fontface = "bold") +
+  ggsave("plots/p4_pop_pyramid.pdf", width = 9, height = 7) 
+```
+
+<br><br>
+
+<div class = "text-center">
+
+# What's Causing the Rural Doctor Shortage? {#part2}
+
+There are many explicit causes of the rural physician shortage. Hospital consolidation, increased specialization, and better opportunities for advancement all drive physicians toward urban areas. However, the broader story of the rural shortage is more complicated. 
+
+The plot below shows the median wage of urban and rural doctors over time. Intuitively, one might expect rural doctors to make less than urban ones. However, since 2000, the wage gap between urban and rural doctors has expanded dramatically, and rural doctors now make roughly $40K *more* than their urban counterparts. Despite this rural pay premium, doctors increasingly choose to practice in urban areas. 
+
+</div>
+
+<br>
+
+```{r wages, message=FALSE, fig.width=9, fig.height=6, fig.align='center'}
+# This chunk does the following:
+# 1. Loads in a previously created subsample of doctor data from IPUMS
+# 2. Bins wages into quartiles by year and urban code
+# 3. Creates a modified line plot using the quartile range and rural/urban code
+# Keep only these years from the IPUMS data (other years have no METRO code)
+wages_years <- c(1960, 1980, 2000, 2010, 2015) 
+# Reading in and filtering previously made IPUMS doctor data
+wages_data <- read_dta("data/acs_pers_phys.dta") %>%
+  mutate(metro = as.numeric(metro)) %>%
+  filter(
+    (educd >= 114 | year < 2000),              # Edu code changed prior to 2000
+    empstat == 1,                              # Must be employed
+    age >= 25,                                 # Only docs over 28 are real
+    year %in% wages_years                      # Only use years with METRO data
+    ) %>%
+  mutate(
+    ur = ifelse(metro %in% c(2, 3, 4), "Urban", "Rural"),
+    sex = ifelse(sex == 1, "Male", "Female"),
+    statefip = str_pad(statefip, 2, "left", "0")
+    ) %>%
+  mutate_at(vars(year, age, perwt), funs(as.numeric))
+# Aggregate the IPUMS data and plot
+wages_data %>%
+  mutate(income = inctot_cpi99 * 1.5) %>% 
+  group_by(year, ur) %>%
+  summarise(
+    lower = wtd.quantile(income, 0.25, weight = perwt),
+    middle = wtd.quantile(income, 0.5, weight = perwt),
+    upper = wtd.quantile(income, 0.75, weight = perwt)
+  ) %>%
+  mutate(ur = factor(ur, levels = c("Rural", "Urban"))) %>%
+ggplot(aes(x = factor(year), color = ur, group = ur)) +
+  geom_rect(aes(
+    xmin = 3.05, xmax = 4.75, ymin = 380000, ymax = 425000),
+    fill = "white", color = "transparent"
+    ) +
+  geom_rect(aes(
+    xmin = 0.7, xmax = 2.5, ymin = 310000, ymax = 390000),
+    fill = "white", color = "transparent"
+    ) +
+  geom_point(
+    aes(y = middle),
+    position = position_dodge(width = 0.2),
+    size = 4
+  ) +
+  geom_linerange(
+    aes(ymin = lower, ymax = upper),
+    position = position_dodge(width = 0.2),
+    alpha = 0.6, linetype = "dashed"
+  ) +
+  geom_line(
+    aes(y = middle),
+    position = position_dodge(width = 0.2),
+    size = 1.1
+  ) +
+  scale_color_manual(
+    values = c(
+      "Rural" = ama_colors[length(ama_colors)],
+      "Urban" = ama_colors[2]
+    )
+  ) +
+  scale_y_continuous(
+    expand = c(0.01, 0.05),
+    label = function(l) {trans = l / 1000; paste0("$", trans, "K")},
+    oob = function(x, ...) x
+  ) +
+  scale_x_discrete(expand = c(0.05, 0.05)) +
+  labs(
+    title = "Rural Doctors Make More Money Than Urban Doctors",
+    subtitle = paste("Since 2000, the pay gap between rural and urban doctors",
+                     "has increased significantly"),
+    caption = "Source: IPUMS-USA, University of Minnesota",
+    x = "Year",
+    y = "Median Income (In 2017 USD)"
+  ) +
+  annotate(
+    "text", x = 1.3, y = 170000, label = "Rural",
+    color = ama_colors[length(ama_colors)], size = 6, fontface = "bold"
+  ) +
+  annotate(
+    "text", x = 1.65, y = 115000, label = "Urban",
+    color = ama_colors[2], size = 6, fontface = "bold"
+  ) +
+  annotate(
+    "text", x = 4.68, y = 386000, lineheight = 0.9,
+    label = paste("In 2015, the median rural doctor made",
+                  "\n $41K more than the median urban one"),
+    vjust = 0, hjust = 1, color = "grey35"
+  ) +
+  annotate(
+    "segment", x = 4.93, xend = 4.7,
+    y = 237000, yend = 378000, color = "grey45"
+  ) +
+  annotate(
+    "text", x = 2.46, y = 330000, lineheight = 0.9,
+    label = paste("Dotted lines represent the interquartile",
+                  "\nrange of income. Since 2000, this range",
+                  "\nhas exploded, with the top quartile of",
+                  "\ndoctors making more than $400K per year"),
+    vjust = 0.15, hjust = 1, color = "grey35"
+  ) +
+  annotate(
+    "segment", x = 2.91, xend = 2.5,
+    y = 310000, yend = 325000, color = "grey45"
+  ) +
+  theme_ama() +
+  theme(
+    legend.position = "none",
+    axis.text = element_text(size = 13),
+    axis.ticks.x = element_blank(),
+    axis.title.x = element_text(margin = margin(t = 10)),
+    axis.title.y = element_text(margin = margin(r = 12)),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank()
+  ) +
+  ggsave("plots/p5_wages.pdf", width = 9, height = 6)
+```
+
+<br>
+
+<div class = "text-center">
+
+By ignoring wage incentives, urban doctors display an overriding hidden preference for urban areas. Previous research (Lombardo et al.) suggests this preference is combination of doctors' preferences for urban amenities and their preference for being around other highly educated people. This partially explains the maldistribution visible in the previous maps. Places such as New England have a high level of educational attainment and nice urban amenities, they therefore have a large number of doctors. Places like Mississippi have low average educational attainment and few urban amenities, they therefore have fewer doctors. 
+
+Doctors have this preference for urban areas regardless of their birthplace. The plot below shows the rurality of where different cohorts of physicians end up attending medical school, doing their residency, and practicing. Each line represents a cohort of physicians born in 1 of 10 core-based statistical area (CBSA) deciles. For example, the pink line represents the most rural-born cohort of doctors, while the purple line represents the most urban-born. Each shaded region represents a different level of rurality. 
+
+All of the doctor cohorts, regardless of their birthplace rurality, end up practicing in urban/suburban areas. After being mechanically forced to urban areas for school (almost all medical schools are in cities), doctors never return to the same rurality level as their birthplace. This indicates that doctors' preferences for urban areas may develop as a result of training in those areas. Based on this assumption, some schools have developed rural programs intended to give doctors a taste of rural life. However, there is little evidence to indicate that such programs increase rural practice retention.
+
+</div>
+
+<br>
+
+```{r doc_movement, message=FALSE, fig.width=9, fig.height=7, fig.align='center'}
+# This chunk does the following:
+# 1. Defines a vector of labels for the periods of a doctor's life
+# 2. Find the average rurality (CBSA) for each period for each birth CBSA cohort
+# 3. Plot the average rurality for each period of a doctor's life, by cohort
+# Define a vector of labels of the periods of a doctors life
+period_labels <- c("Birth", "Med School", "Residency",
+                   "2003", "2008", "2013", "Current")
+# Aggregate by period and rurality then plot
+ama_filtered %>%
+  filter(yot <= 1998) %>%
+  group_by(birth_qcbsa) %>%
+  summarize(
+    t1 = mean(med_qcbsa, na.rm = T),
+    t2 = mean(res_qcbsa, na.rm = T),
+    t3 = mean(`2003_qcbsa`, na.rm = T),
+    t4 = mean(`2008_qcbsa`, na.rm = T),
+    t5 = mean(`2013_qcbsa`, na.rm = T),
+    t6 = mean(`geoid_qcbsa`, na.rm = T)
+    ) %>%
+  filter(!is.na(birth_qcbsa)) %>%
+  mutate(bcbsa = birth_qcbsa) %>%
+  gather(key = period, value = rurality, -bcbsa) %>%
+  mutate(period = replace(period, period == "birth_qcbsa", "t0")) %>%
+ggplot() +
+  geom_rect(aes(
+    xmin = -Inf, xmax = Inf, ymin = -Inf,
+    ymax = 2.5), fill = "grey95", alpha = 0.05) +
+  geom_rect(aes(
+    xmin = -Inf, xmax = Inf, ymin = 2.5,
+    ymax = 4), fill = "white", alpha = 0.05) +
+  geom_rect(aes(
+    xmin = -Inf, xmax = Inf, ymin = 4,
+    ymax = 6), fill = "grey95", alpha = 0.05) +
+  geom_rect(aes(
+    xmin = -Inf, xmax = Inf, ymin = 6,
+    ymax = 8.25), fill = "white", alpha = 0.05) +
+  geom_rect(aes(
+    xmin = -Inf, xmax = Inf, ymin = 8.25,
+    ymax = Inf), fill = "grey95", alpha = 0.05) +
+  geom_line(aes(
+    x = period, y = rurality,
+    color = factor(bcbsa), group = bcbsa), size = 1.1) +
+  geom_vline(xintercept = 1, linetype = "longdash", color = "grey45") +
+  scale_color_manual(values = rev(ama_colors_10)) +
+  scale_x_discrete(
+    labels = period_labels,
+    expand = expand_scale(mult = c(0.2, 0.05))
+    ) +
+  labs(
+    title = "Doctors Move to Urban Areas Regardless of Birthplace",
+    subtitle = paste("Ten groups of doctors, sorted by the rurality of their",
+                     "birthplace, all end up in urban and suburban areas"),
+    x = "Event / Period",
+    caption = "Source: American Medical Association Master File"
+  ) +
+  theme_ama() +
+  theme(
+    axis.title.x = element_text(margin = margin(t = 8), size = 14),
+    axis.text.y.left = element_blank(),
+    axis.ticks.y = element_blank(),
+    panel.grid.major.x = element_line(color = "grey60"),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.title.y.left = element_blank(),
+    legend.position = "none"
+  ) +
+  annotate(
+    "text", label = "Rural", x = 0.4, y = 1.5,
+    size = 7, color = "grey65", fontface = 2) +
+  annotate(
+    "text", label = "Small\nTown", x = 0.4, y = 3.25,
+    size = 7, color = "grey65", fontface = 2, lineheight = 0.9) +
+  annotate(
+    "text", label = "Sub-\nUrban", x = 0.4, y = 5,
+    size = 7, color = "grey65", fontface = 2, lineheight = 0.9) +
+  annotate(
+    "text", label = "Urban", x = 0.4, y = 7,
+    size = 7, color = "grey65", fontface = 2) +
+  annotate(
+    "text", label = "Urban\nCore", x = 0.4, y = 9.25,
+    size = 7, color = "grey65", fontface = 2, lineheight = 0.9) +
+  annotate(
+    "segment", x = 1.01, xend = 1.35,
+    y = 1, yend = 1.21, color = "grey45") +
+  annotate(
+    "text",
+    label = paste0(
+      "This line represents the group of doctors born in the most rural\n",
+      "decile of Core-based Statistical Areas (CBSA), think rural Kansas"),
+    x = 1.41, y = 1.45, color = "grey35", hjust = 0, lineheight = 0.9
+    ) +
+  annotate(
+    "segment", x = 2.02, xend = 2.25,
+    y = 5.35, yend = 3.75, color = "grey45") +
+  annotate(
+    "text",
+    label = paste0(
+      "Almost all medical schools are in urban areas,\n",
+      "so medical students are mechanically forced to move"),
+    x = 2.28, y = 3.51, color = "grey35", hjust = 0, lineheight = 0.9
+    ) + 
+  annotate("segment", x = 3.02, xend = 3.15, y = 8, yend = 9, color = "grey45") +
+  annotate(
+    "text",
+    label = paste0(
+      "After medical school, doctors disperse to more\n",
+      "rural residency programs - doctors from rural areas\n",
+      "select more rural programs than those from cities"),
+    x = 3.17, y = 9.5, color = "grey35", hjust = 0, lineheight = 0.9
+    ) +
+  annotate(
+    "segment", x = 4.02, xend = 4.21,
+    y = 7.355, yend = 7.9, color = "grey45") +
+  annotate(
+    "text",
+    label = paste0(
+      "Once doctors choose a practice\n",
+      "location they tend to stay put"),
+    x = 4.25, y = 7.85, color = "grey35", hjust = 0, lineheight = 0.9
+    ) +
+  ggsave("plots/p6_doc_movement.pdf", width = 9, height = 7)
+```
+
+<br>
+
+<div class = "text-center">
+
+Medical schools also play a role in determining where a doctor chooses to practice. The plot below shows the average MCAT score of each medical school compared to the rurality of the average graduate's practice location. Graduates of better medical schools tend to end up practicing in more urban areas.
+
+The reason for this is two-fold. First, better medical schools tend to be located in large cities. Doctors at these schools likely develop preferences for big city amenities as well as business and social networks that make leaving undesirable. Second, graduates of better medical schools are more likely to be matched with their preferred residency programs, i.e. they are unlikely to be forced to attend less competitive rural programs.
+
+</div>
+
+<br>
+
+```{r med_schools, message=FALSE, warning=FALSE, fig.width=9, fig.height=7, fig.align='center'}
+# This plot does the following:
+# 1. Creates a vector of labels for different CBSA quantiles
+# 2. Gets the doctor count, average graduate rurality, and mcat of each school
+# 3. Picks a subset of outlier schools to label
+# 4. Creates a scatterplot + regression of MCAT score by rurality
+# Define a vector of urban level labels
+med_ur_labels <- c(rep("", 2), "More Rural", rep("", 3),
+               "Suburban", rep("", 3), "More Urban", rep("", 2))
+# Get the doctor count, rurality, and mcat of each med school
+med_data <- ama_filtered %>%
+  group_by(med_school_id, med_address) %>%
+  summarize(
+    st_count = n(),
+    avg_score = mean(med_mcat_score, na.rm = T),
+    prac_qcbsa = mean(`2013_qcbsa`, na.rm = T)
+    ) %>%
+  filter(!is.na(avg_score) & st_count >= 1000) 
+# Create a dataframe of labels for select med schools
+med_data_labels <- med_data %>%
+  filter(med_school_id %in% c("03519", "02701", "05101")) %>% 
+  bind_cols(school_name = c("Ole Miss", "NYU", "UVA"))
+# Create a plot of MCAT score by rurality, with count as point size 
+ggplot() +
+  geom_point(
+    data = med_data,
+    aes(x = prac_qcbsa, y = avg_score, size = st_count),
+    alpha = 0.3,
+    color = "grey25",
+    fill = "grey25"
+    ) +
+  stat_smooth(
+    data = med_data,
+    aes(x = prac_qcbsa, y = avg_score, weight = st_count),
+    method = "lm",
+    fullrange = T,
+    se = F,
+    size = 1.5,
+    color = ama_colors[length(ama_colors)]
+    ) +
+  geom_text_repel(
+    data = med_data_labels,
+    aes(x = prac_qcbsa, y = avg_score, label = school_name),
+    color = "grey35",
+    segment.color = "grey45",
+    nudge_y = -1.4,
+    nudge_x = -0.1
+  ) +
+  scale_x_continuous(
+    limits = c(3, 9),
+    expand = c(0, 0), 
+    breaks = seq(3, 9, 0.5),
+    labels = med_ur_labels
+    ) +
+  scale_y_continuous(limits = c(499, 521), breaks = seq(499, 521, by = 4)) +
+  scale_size_continuous(name = "# of Graduates") +
+  labs(
+    title = "Competitive Medical Schools Send Their Graduates to Urban Areas",
+    subtitle = paste("The higher the average MCAT score of the school,", 
+                     "the more likely its graduates are to practice in a city"),
+    x = "Average Rurality of Graduate Practice Location",
+    y = "School MCAT Score",
+    caption = "Source: American Medical Association Master File"
+  ) +
+  theme_ama() +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.ticks.x = element_blank(),
+    legend.justification = "top",
+    legend.position = c(.1, .98)
+  ) +
+  annotate(
+    "rect", xmin = 3, xmax = 4.2,
+    ymin = 513, ymax = Inf, fill = "white") +
+  annotate(
+    "segment", x = 7.31, xend = 7.48, y = 508, yend = 509, color = "grey45"
+  ) +
+  annotate(
+    "text", x = 7.51, y = 509, hjust = 0,
+    label = paste0("UCLA has a low average \n",
+                  "MCAT score of 508, yet \n",
+                  "most of its graduates \n",
+                  "live in very urban areas"),
+    lineheight = 0.9, color = "grey35"
+    ) +
+  ggsave("plots/p7_med_schools.pdf", width = 9, height = 7)
+```
+
+<br>
+
+<div class = "text-center">
+
+The rise in specialist physicians has also contributed to the rural doctor shortage. As more medical students choose high-paying specialties, the proportion of primary care physicians trained each year has decreased, particularly since 2001. The plot below shows this trend. 
+
+Specialists are much more likely to practice in urban areas than primary care physicians. Rural areas rarely produce the demand needed to support a specialist. Even if rural demand was sufficient, most rural hospitals do not have the infrastructure, equipment, or funds necessary to support full-time specialists. As a result, specialists are much more likely to live and practice in urban areas.
+
+</div>
+
+<br>
+
+```{r specialties, message=FALSE, fig.width=9, fig.height=7, fig.align='center'}
+# This chunk does the following:
+# 1. Creates a vector of primary care codes
+# 2. Splits GPs and specialists by year of training
+# 3. Generate a line plot of GPs and specialists over time
+# Define a vector of all primary care codes
+spec_primary_care_codes <- c(
+  "ADL", "AMF", "AMI", "FMP", "FP", "FPG",
+  "GP", "GPM", "IM", "IMG", "IPM", "MPD", "PD")
+# Create a dataframe of GPs and specialists by year of training
+spec_data <- ama_filtered %>%
+  filter(between(yot, 1900, 2016)) %>%
+  mutate(
+    GP = ifelse(
+      primary_specialty %in% spec_primary_care_codes,
+      "Primary Care",
+      "Specialist")
+    ) %>% 
+  group_by(yot, GP) %>%
+  summarize(doc_count = n()) %>%
+  filter(yot >= 1975)
+# Spread this dataframe and calc the difference between specialists and GPs
+spec_data_diff <- spec_data %>%
+  spread(key = GP, value = doc_count) %>%
+  filter(yot %in% c(1980, 2000, 2015)) %>%
+  mutate(diff = `Specialist` - `Primary Care`)
+# Create a line plot of specialists and GPs over time
+ggplot() +
+  geom_line(
+    data = spec_data,
+    aes(x = yot, y = doc_count, color = factor(GP)),
+    size = 1.5
+    ) +
+  geom_segment(
+    data = spec_data_diff,
+    aes(x = yot, xend = yot, y = `Primary Care`, yend = `Specialist`),
+    color = "grey30",
+    linetype = "longdash"
+    ) +
+  scale_color_manual(values = c(
+    ama_colors[length(ama_colors)],
+    ama_colors[2])
+    ) +
+  scale_x_continuous(
+    breaks = seq(1975, 2016, by = 5),
+    expand = c(0, 0)) +
+  scale_y_continuous(
+    breaks = seq(0, 20000, by = 4000), 
+    labels = comma,
+    limits = c(0, 20000),
+    expand = c(0, 0)
+    ) + 
+  labs(
+    title = "More Doctors Are Becoming Specialists",
+    subtitle = paste("As tuition costs rise, lucrative specialities",
+                     "are attracting more and more medical students"),
+    x = "Year",
+    y = "Residency Program Graduates Per Year",
+    caption = "Source: American Medical Association Master File"
+  ) +
+  theme_ama() +
+  theme(
+    legend.position = "none",
+    axis.title.y = element_text(margin = margin(r = 6))) +
+  guides(colour = guide_legend(nrow = 1)) +
+  annotate(
+    "text", label = "Specialists", x = 2012,
+    y = 18900, size = 5, color = ama_colors[2], fontface = "bold") + 
+  annotate(
+    "text", label = "Primary Care", x = 2012,
+    y = 6500, size = 5, color = ama_colors[length(ama_colors)],
+    fontface = "bold") + 
+  annotate(
+    "text", label = paste0(spec_data_diff$diff[1]),
+    x = 1978.5, y = 5300, size = 4, color = "grey35") +
+  annotate(
+    "text", label = paste0(spec_data_diff$diff[2]),
+    x = 1998.3, y = 11200, size = 4.8, color = "grey35") +
+  annotate(
+    "text", label = paste0(spec_data_diff$diff[3]),
+    x = 2012.8, y = 13200, size = 6.5, color = "grey35") +
+  annotate(
+    "text", label = paste(
+      "Since 2000, the number of\n",
+      "specialists trained per year\n",
+      "over primary care physicians\n", 
+      "has nearly doubled"),
+    hjust = 1,
+    x = 2014.3, 
+    y = 10200, 
+    color = "grey35",
+    lineheight = .9) +
+  ggsave("plots/p8_specialists.pdf", width = 9, height = 7)
+```
+
+<br><br>
+
+<div class = "text-center">
+
+# How Do We Fix the Rural Doctor Shortage? {#part3}
+
+The current state of rural America is bleak. Doctors are overwhelmingly clustered in urban and highly educated areas. The existing cohort of rural doctors is rapidly aging and is unlikely to be replaced. More and more doctors are becoming specialists who can only viably practice in cities. Solving the rural doctor shortage seems like an impossible task. 
+
+Previous solutions have focused on increasing the compensation of rural doctors, yet this strategy seems to be ineffective. Doctors have such a strong preference for urban areas that it overrides any incentives created by relatively small rural wage premiums. Given this preference, the high earnings of most physicians, and the marginal utility of money, it would likely take a *massive* wage premium to begin attracting marginal doctors to rural areas.
+
+Instead, two solutions should be implemented. First, medical schools should recruit more students from rural areas. Plot 6 shows that such students are the most likely to practice in rural areas. These students have pre-existing preferences for rurality, i.e. they are not as prone to developing strong preferences for urban areas because they already prefer rural ones. Additionally, students from rural areas are already invested in and familiar with rural communities. Recruiting more of these students would undoubtedly bolster the number of rural physicians.
+
+Second, states should focus on training and licensing more nurse practitioners (NPs). The plot below shows that nurse practitioners already serve as substitutes in states with relatively few doctors. NPs can perform the same basic tasks as a primary care physicians but are cheaper and easier to train and license. Substituting NPs in rural areas could reduce the impact of the rural physician shortage and improve basic health outcomes for rural Americans.
+
+</div>
+
+<br>
+
+```{r nurses, message=FALSE, fig.width=9, fig.height=8, fig.align='center'}
+# This chunk does the following:
+# 1. Loads Kaiser Family Foundation data on the number of nurses per state
+# 2. Joins KFF data to previously made data on the number of docs per state
+# 3. Determines the rank of all states in terms of nurse/doc pop per 100k
+# 4. Selects the top 4 largest changes in total rank
+# 5. Creates a plot showing the rank change for these 4 states as an additive
+#    facet plot
+# Load in nurse data from the Kaiser Family Foundation and merge doc data
+nurses_data <- read_csv("data/kff_states_raw_data.csv") %>%
+  left_join(
+    fips_codes %>% distinct(state_name, state_code, state),
+    by = "state_name"
+  ) %>%
+  filter(state_name != "United States") %>%
+  select(state, state_code, np_total, pa_total, rn_total) %>%
+  left_join(state_data, by = c("state_code" = "state"))
+# Determine the rank of each state in terms of nurses/docs per 100k population
+nurses_rank <- left_join(
+  state_map,
+  nurses_data,
+  by = c("GEOID" = "state_code")
+  ) %>%
+  rename(
+    state_code = GEOID,
+    state_pop = estimate
+  ) %>%
+  select(-NAME, -variable, -moe) %>%
+  st_set_geometry(NULL) %>%
+  filter(!state %in% c("HI", "DC")) %>%
+  mutate_at(
+    vars(np_total:doc_count),
+    funs(rank((. / state_pop) * 1e5))
+  ) %>%
+  mutate(
+    total_rank = rank(abs(doc_count - rn_total) - abs(rn_total - np_total))
+  ) %>%
+  gather(type, rank, np_total:doc_count) %>%
+  mutate(
+    type = factor(type,
+      levels = rev(c("doc_count", "rn_total", "np_total", "pa_total"))),
+    rank_cutoff = total_rank >= max(total_rank) - 3
+  ) %>%
+  filter(type != "pa_total")
+  
+# Selects the four states that have the largest rank changes
+nurses_rank_select <- nurses_rank %>%
+  filter(rank_cutoff) %>%
+  group_by(state) %>%
+  mutate(group_idx = group_indices() / n_groups(.) / 2.5) %>%
+  ungroup() %>%
+  mutate(group_idx = group_idx - median(group_idx)) %>%
+  uncount(rep(4:1, 3), .id = "id") %>%
+  mutate(id = abs(id - 5)) %>%
+  group_by(id, state) %>%
+  mutate(id_color = case_when(
+    state == "MS" & id == 1 ~ 1,
+    state == "WA" & id == 2 ~ 1,
+    state == "IA" & id == 3 ~ 1,
+    state == "OR" & id == 4 ~ 1,
+    TRUE ~ 0
+  )) 
+  
+# Some recoding tomfoolery to get the facet wrap working
+nurses_rank <- nurses_rank %>%
+  uncount(4, .id = "id") %>%
+  left_join(
+    nurses_rank_select %>% select(state, type, id_color),
+    by = c("state", "type", "id")
+  ) %>%
+  mutate(
+    id_color = factor(replace_na(id_color, 2)),
+    id = recode(id,
+      "1" = "Mississippi",
+      "2" = "Washington",
+      "3" = "Iowa",
+      "4" = "Oregon"),
+    id = factor(id, levels = c("Mississippi", "Washington", "Iowa", "Oregon"))
+  ) 
+nurses_rank_select <- nurses_rank_select %>%
+  ungroup() %>%
+  mutate(
+    id = recode(id,
+      "1" = "Mississippi",
+      "2" = "Washington",
+      "3" = "Iowa",
+      "4" = "Oregon"),
+    id = factor(id, levels = c("Mississippi", "Washington", "Iowa", "Oregon"))
+  ) %>%
+  filter(id_color != 0)  # Remove this line for additive facets
+
+# Create the facet wrap plot
+nurses_rank %>%
+  mutate(id_color = recode(  # Also remove this line for additive facets
+    id_color, "0" = "2", "1" = "1", "2" = "2")
+  ) %>%
+ggplot() +
+  geom_text(
+    aes(x = rank, y = type, label = state, color = id_color), size = 2.5
+  ) +
+  geom_line(
+    data = nurses_rank_select %>% filter(type %in% c("doc_count", "rn_total")),
+    aes(x = rank, y = 2.5 + group_idx, group = state, color = factor(id_color)),
+    size = 1.0
+  ) +
+  geom_segment(
+    data = nurses_rank_select %>% filter(type == "doc_count"),
+    aes(
+      x = rank, xend = rank,
+      y = 2.85, yend = 2.5 + group_idx,
+      color = factor(id_color)),
+    size = 1.0
+  ) +
+  geom_segment(
+    data = nurses_rank_select %>% filter(type == "rn_total"),
+    aes(
+      x = rank, xend = rank,
+      y = 2.5 + group_idx, yend = 2.15,
+      color = factor(id_color)),
+    size = 1.0
+  ) +
+  geom_line(
+    data = nurses_rank_select %>% filter(type %in% c("rn_total", "np_total")),
+    aes(x = rank, y = 1.5 + group_idx, group = state, color = factor(id_color)),
+    size = 1.0
+  ) +
+  geom_segment(
+    data = nurses_rank_select %>% filter(type == "rn_total"),
+    aes(
+      x = rank, xend = rank,
+      y = 1.85, yend = 1.5 + group_idx,
+      color = factor(id_color)),
+    size = 1.0
+  ) + 
+  geom_segment(
+    data = nurses_rank_select %>% filter(type == "np_total"),
+    aes(
+      x = rank, xend = rank,
+      y = 1.5 + group_idx, yend = 1.15,
+      color = factor(id_color)),
+    size = 1.0
+  ) +
+  geom_text(
+    data = tibble(
+      id = as.factor(c("Mississippi", "Washington", "Iowa", "Oregon")),
+      label = c("Doctors\n\nNurse\nPracitioners\n\nRegistered\nNurses",
+                rep("Docs\n\n\nNPs\n\n\nRNs", 3))),
+    aes(x = 0.3, y = 2.03, label = label), lineheight = 0.885,
+    size = 3.8, hjust = 1, vjust = 0.5, color = "grey35"
+  ) +
+  geom_text(
+    data = tibble(
+      id = as.factor(c("Mississippi", "Washington", "Iowa", "Oregon")),
+      label = c("Least", "", "", "")),
+    aes(x = 6, y = 4.28, label = label),
+    size = 5, hjust = 0, color = "grey35"
+  ) +
+  geom_segment(
+    data = tibble(
+      id = as.factor(c("Mississippi", "Washington", "Iowa", "Oregon")),
+      color = c("arrow_col", "null_col", "null_col", "null_col")),
+    aes(x = 5.5, xend = 1, y = 4.28, yend = 4.28, color = color),
+    arrow = arrow(length = unit(0.1, "inches"), type = "closed")
+  ) +
+  geom_text(
+    data = tibble(
+      id = as.factor(c("Mississippi", "Washington", "Iowa", "Oregon")),
+      label = c("Most", "", "", "")),
+    aes(x = 44, y = 4.28, label = label),
+    size = 5, hjust = 1, color = "grey35"
+  ) +
+  geom_segment(
+    data = tibble(
+      id = as.factor(c("Mississippi", "Washington", "Iowa", "Oregon")),
+      color = c("arrow_col", "null_col", "null_col", "null_col")),
+    aes(x = 44.5, xend = 49, y = 4.28, yend = 4.28, color = color),
+    arrow = arrow(length = unit(0.1, "inches"), type = "closed")
+  ) +
+  scale_x_continuous(
+    position = "top",
+    expand = c(0.01, 0.0)
+  ) +
+  scale_y_discrete(
+    expand = c(0.1, 0.1),
+    labels = c("NPs", "RNs", "MDs")
+  ) +
+  scale_color_manual(
+    values = c(
+      "2" = "grey80",
+      "1" = ama_colors[length(ama_colors)],
+      "0" = "#fce8de",
+      "arrow_col" = "grey35",
+      "null_col" = "transparent")
+  ) +
+  scale_fill_manual(values = c("transparent", "white")) +
+  facet_wrap(vars(id), ncol = 1) +
+  coord_cartesian(xlim = c(1, 49), ylim = c(1, 3), clip = "off") +
+  labs(
+    title = "Nurses Serve as Substitutes in States with Few Doctors",
+    subtitle = paste(
+      "States with the lowest number of doctors per 100K people",
+      "have the highest number of nurses, and visa versa"),
+    y = "Type of Practitioner",
+    x = "States Ranked by # of Practitioners (Per 100K Pop.)",
+    caption = paste0(
+      "Sources: American Medical Association Master File",
+      "\nKaiser Family Foundation")
+  ) +
+  theme_ama() +
+  theme(
+    legend.position = "none",
+    panel.border = element_rect(color = "transparent"),
+    panel.grid = element_blank(),
+    panel.spacing.y = unit(0, "pt"),
+    strip.background = element_rect(color = "transparent"),
+    strip.text = element_text(size = 14, color = "grey55", face = "bold"),
+    plot.subtitle = element_text(margin = margin(b = 20)),
+    plot.caption = element_text(lineheight = 1.1),
+    axis.title.x = element_text(margin = margin(b = 10)),
+    axis.title.y = element_text(margin = margin(r = 40)),
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank()
+  ) +
+  ggsave("plots/p9_nurses.png", width = 9, height = 8)
